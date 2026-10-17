@@ -20,8 +20,10 @@ import {
   getProjectSortTimestamp,
   getSidebarForkParentThreadId,
   getSidebarThreadIdsToPrewarm,
+  groupSidebarSectionThreads,
   hasUnseenCompletion,
   isContextMenuPointerDown,
+  isSidebarDelegatedTaskThread,
   isSidebarSubagentThread,
   isSidebarThreadWorking,
   isTrailingDoubleClick,
@@ -38,6 +40,7 @@ import {
   resolveSidebarV2TopStatus,
   resolveThreadLastVisitedAt,
   resolveThreadRowClassName,
+  sidebarGroupParentThreadId,
   resolveThreadStatusPill,
   resolveWorkingStartedAt,
   pullRequestMatchesSearchQuery,
@@ -394,6 +397,153 @@ describe("resolveSidebarStageBadgeLabel", () => {
         fallbackStageLabel: "Alpha",
       }),
     ).toBe("Alpha");
+  });
+});
+
+describe("sidebar thread grouping", () => {
+  const environmentId = EnvironmentId.make("environment-group");
+  const projectA = ProjectId.make("project-a");
+  const projectB = ProjectId.make("project-b");
+  const keyOf = (thread: Thread) => `${thread.environmentId}:${thread.id}`;
+  const projectKeyOf = (thread: Thread) => `${thread.environmentId}:${thread.projectId}`;
+  const groupParentKeyOf = (thread: Thread) => {
+    const parentId = sidebarGroupParentThreadId(thread);
+    return parentId === null ? null : `${thread.environmentId}:${parentId}`;
+  };
+  const session = (id: string, projectId = projectA) =>
+    makeThreadFixture({ id: ThreadId.make(id), environmentId, projectId });
+  const delegated = (id: string, parent: Thread, creationSource: "mcp" | "provider" = "mcp") => {
+    const thread = makeThreadFixture({
+      id: ThreadId.make(id),
+      environmentId,
+      projectId: parent.projectId,
+      lineage: {
+        rootThreadId: parent.lineage.rootThreadId,
+        parentThreadId: parent.id,
+        relationshipToParent: "subagent",
+      },
+    });
+    return { ...thread, source: { ...thread.source, creationSource } };
+  };
+  const launched = (id: string, launcher: Thread, projectId = launcher.projectId) =>
+    makeThreadFixture({
+      id: ThreadId.make(id),
+      environmentId,
+      projectId,
+      lineage: {
+        rootThreadId: ThreadId.make(id),
+        parentThreadId: null,
+        relationshipToParent: null,
+        launchedByThreadId: launcher.id,
+      },
+    });
+  const group = (
+    threads: readonly Thread[],
+    options: {
+      collapsedProjectGroups?: readonly string[];
+      expandedThreadGroups?: readonly string[];
+      revealKey?: string | null;
+    } = {},
+  ) =>
+    groupSidebarSectionThreads(threads, {
+      section: "active",
+      keyOf,
+      groupParentKeyOf,
+      projectKeyOf,
+      collapsedProjectGroups: new Set(options.collapsedProjectGroups ?? []),
+      expandedThreadGroups: new Set(options.expandedThreadGroups ?? []),
+      revealKey: options.revealKey ?? null,
+    }).map((row) =>
+      row.kind === "project"
+        ? `project ${row.projectKey} (${row.threadCount})${row.expanded ? "" : " collapsed"}`
+        : row.kind === "children"
+          ? `children of ${row.parentKey} (${row.children.length})${row.expanded ? "" : " collapsed"}`
+          : `${row.depth === 1 ? "  " : ""}${row.thread.id}`,
+    );
+
+  it("shows T3-delegated tasks when asked but keeps provider-native subagents hidden", () => {
+    const parent = session("parent");
+    const task = delegated("task", parent);
+    const native = delegated("native", parent, "provider");
+
+    expect(isSidebarDelegatedTaskThread(task)).toBe(true);
+    expect(isSidebarDelegatedTaskThread(native)).toBe(false);
+    expect(filterSidebarV2VisibleThreads([parent, task, native], null).map((t) => t.id)).toEqual([
+      parent.id,
+    ]);
+    expect(
+      filterSidebarV2VisibleThreads([parent, task, native], null, {
+        includeDelegatedTasks: true,
+      }).map((t) => t.id),
+    ).toEqual([parent.id, task.id]);
+  });
+
+  it("nests delegated and launched threads under the session that started them", () => {
+    const parent = session("parent");
+    const task = delegated("task", parent);
+    const launchedThread = launched("launched", parent);
+    const native = delegated("native", parent, "provider");
+
+    expect(sidebarGroupParentThreadId(task)).toBe(parent.id);
+    expect(sidebarGroupParentThreadId(launchedThread)).toBe(parent.id);
+    expect(sidebarGroupParentThreadId(native)).toBeNull();
+    expect(sidebarGroupParentThreadId(parent)).toBeNull();
+  });
+
+  it("groups by project in first-row order and collapses child groups by default", () => {
+    const parent = session("parent");
+    const other = session("other", projectB);
+    const task = delegated("task", parent);
+    const nestedTask = delegated("nested-task", task);
+    const launchedThread = launched("launched", parent);
+
+    expect(group([task, other, parent, nestedTask, launchedThread])).toEqual([
+      `project ${environmentId}:${projectA} (4)`,
+      "parent",
+      `children of ${environmentId}:parent (3) collapsed`,
+      `project ${environmentId}:${projectB} (1)`,
+      "other",
+    ]);
+    expect(
+      group([parent, task, nestedTask, other], {
+        expandedThreadGroups: [`${environmentId}:parent`],
+        collapsedProjectGroups: [`active:${environmentId}:${projectB}`],
+      }),
+    ).toEqual([
+      `project ${environmentId}:${projectA} (3)`,
+      "parent",
+      `children of ${environmentId}:parent (2)`,
+      "  task",
+      "  nested-task",
+      `project ${environmentId}:${projectB} (1) collapsed`,
+    ]);
+  });
+
+  it("keeps a thread top-level when its session is not in the same section", () => {
+    const parent = session("parent");
+    const launchedThread = launched("launched", parent);
+
+    expect(group([launchedThread])).toEqual([
+      `project ${environmentId}:${projectA} (1)`,
+      "launched",
+    ]);
+  });
+
+  it("expands the project and session groups holding the open thread", () => {
+    const parent = session("parent");
+    const task = delegated("task", parent);
+
+    expect(
+      group([parent, task], {
+        collapsedProjectGroups: [`active:${environmentId}:${projectA}`],
+        revealKey: `${environmentId}:task`,
+      }),
+    ).toEqual([
+      `project ${environmentId}:${projectA} (2)`,
+      "parent",
+      `children of ${environmentId}:parent (1)`,
+      "  task",
+    ]);
   });
 });
 

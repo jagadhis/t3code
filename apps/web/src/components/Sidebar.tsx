@@ -69,6 +69,7 @@ import {
   AlarmClockOffIcon,
   ArrowRightLeftIcon,
   CheckIcon,
+  ChevronRightIcon,
   CircleAlertIcon,
   CircleCheckIcon,
   CircleDashedIcon,
@@ -188,6 +189,10 @@ import {
   animateSidebarLayoutChanges,
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
+  groupSidebarSectionThreads,
+  isSidebarDelegatedTaskThread,
+  sidebarGroupParentThreadId,
+  type SidebarGroupedRow,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
   deleteSelectedThreadEntries,
@@ -363,6 +368,29 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
+const COLLAPSED_PROJECT_GROUPS_KEY = "t3code:sidebar:collapsed-project-groups";
+const EXPANDED_THREAD_GROUPS_KEY = "t3code:sidebar:expanded-thread-groups";
+const SidebarGroupKeys = Schema.Array(Schema.String);
+const NO_GROUP_KEYS: readonly string[] = [];
+
+type SidebarProjectKey = ReturnType<typeof threadProjectKey>;
+
+export type SidebarGroupMarkerInfo =
+  | {
+      readonly kind: "project";
+      readonly groupKey: string;
+      readonly projectKey: SidebarProjectKey;
+      readonly threadCount: number;
+      readonly expanded: boolean;
+    }
+  | {
+      readonly kind: "children";
+      readonly parentKey: string;
+      readonly childCount: number;
+      readonly workingCount: number;
+      readonly attentionCount: number;
+      readonly expanded: boolean;
+    };
 
 const inboxReturns = createInboxReturnTracker();
 
@@ -383,6 +411,7 @@ interface SidebarThreadPartitionInput {
   readonly serverConfigs: ReadonlyMap<EnvironmentId, EnvironmentServerConfig>;
   readonly optimisticDrop: SidebarOptimisticDrop | null;
   readonly workingShelfEnabled: boolean;
+  readonly groupingEnabled: boolean;
   // Snooze wakes and the queued-turn grace depend on the clock, so the minute
   // tick and the precise snooze-wake tick are inputs: a new key repartitions.
   readonly clockKey: string;
@@ -390,6 +419,19 @@ interface SidebarThreadPartitionInput {
 
 function threadShellKey(thread: Pick<SidebarThreadSummary, "environmentId" | "id">): string {
   return scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+}
+
+function groupParentShellKey(thread: EnvironmentThreadShell): string | null {
+  const parentId = sidebarGroupParentThreadId(thread);
+  return parentId === null ? null : scopedThreadKey(scopeThreadRef(thread.environmentId, parentId));
+}
+
+function threadProjectKey(thread: Pick<SidebarThreadSummary, "environmentId" | "projectId">) {
+  return `${thread.environmentId}:${thread.projectId}` as const;
+}
+
+function toggleGroupKey(keys: readonly string[], key: string): readonly string[] {
+  return keys.includes(key) ? keys.filter((candidate) => candidate !== key) : [...keys, key];
 }
 
 const NO_DRAGGED_ORDER: readonly string[] = [];
@@ -450,6 +492,17 @@ function useSidebarThreads(input: {
     input;
   const threads = useThreadShells();
   const workingShelfEnabled = useClientSettings((s) => s.sidebarWorkingShelfEnabled);
+  const groupingEnabled = useClientSettings((s) => s.sidebarThreadGrouping === "project_session");
+  const [collapsedProjectGroups, setCollapsedProjectGroups] = useLocalStorage(
+    COLLAPSED_PROJECT_GROUPS_KEY,
+    NO_GROUP_KEYS,
+    SidebarGroupKeys,
+  );
+  const [expandedThreadGroups, setExpandedThreadGroups] = useLocalStorage(
+    EXPANDED_THREAD_GROUPS_KEY,
+    NO_GROUP_KEYS,
+    SidebarGroupKeys,
+  );
   const nowMinute = useNowMinute();
   // Snooze wake times are second-precise, so classifying with the quantized
   // minute would hold a woken thread on the shelf for up to a minute.
@@ -491,6 +544,7 @@ function useSidebarThreads(input: {
     serverConfigs,
     optimisticDrop,
     workingShelfEnabled,
+    groupingEnabled,
     clockKey: `${nowMinute}:${snoozeWakeTick}`,
   });
   const partitionNextWakeAt = partition.snoozedThreads[0]?.snoozedUntil ?? null;
@@ -518,12 +572,65 @@ function useSidebarThreads(input: {
   const visibleWorkingThreads = workingShelfExpanded
     ? workingThreads
     : routeThreadOnly(workingThreads, routeThreadKey);
+  const collapsedProjectGroupSet = new Set(collapsedProjectGroups);
+  const expandedThreadGroupSet = new Set(expandedThreadGroups);
+  const groupSection = (
+    list: readonly EnvironmentThreadShell[],
+    section: SidebarSection,
+  ): readonly SidebarGroupedRow<EnvironmentThreadShell, SidebarProjectKey>[] | null =>
+    groupingEnabled
+      ? groupSidebarSectionThreads(list, {
+          section,
+          keyOf: threadShellKey,
+          groupParentKeyOf: groupParentShellKey,
+          projectKeyOf: threadProjectKey,
+          collapsedProjectGroups: collapsedProjectGroupSet,
+          expandedThreadGroups: expandedThreadGroupSet,
+          revealKey: routeThreadKey,
+        })
+      : null;
+  const groupedRowsBySection = {
+    pinned: groupSection(pinnedThreads, "pinned"),
+    active: groupSection(activeThreads, "active"),
+    working: groupSection(visibleWorkingThreads, "working"),
+    snoozed: groupSection(visibleSnoozedThreads, "snoozed"),
+    settled: groupSection(renderedSettledThreads, "settled"),
+  } satisfies Record<SidebarSection, unknown>;
+  const groupMarkerInfo = new Map<SidebarListMarker, SidebarGroupMarkerInfo>();
+  const visibleThreadsOf = (
+    list: readonly EnvironmentThreadShell[],
+    rows: readonly SidebarGroupedRow<EnvironmentThreadShell, SidebarProjectKey>[] | null,
+  ): readonly EnvironmentThreadShell[] => {
+    if (rows === null) return list;
+    const visible: EnvironmentThreadShell[] = [];
+    for (const row of rows) {
+      if (row.kind === "thread") visible.push(row.thread);
+      else if (row.kind === "project") {
+        groupMarkerInfo.set(`project-group:${row.groupKey}`, row);
+      } else {
+        groupMarkerInfo.set(`thread-children:${row.parentKey}`, {
+          kind: "children",
+          parentKey: row.parentKey,
+          childCount: row.children.length,
+          workingCount: row.children.filter(isSidebarThreadWorking).length,
+          attentionCount: row.children.filter(
+            (child) =>
+              child.hasPendingApprovals ||
+              child.hasPendingUserInput ||
+              child.pendingSubagentRequest != null,
+          ).length,
+          expanded: row.expanded,
+        });
+      }
+    }
+    return visible;
+  };
   const orderedThreads = [
-    ...pinnedThreads,
-    ...activeThreads,
-    ...visibleWorkingThreads,
-    ...visibleSnoozedThreads,
-    ...renderedSettledThreads,
+    ...visibleThreadsOf(pinnedThreads, groupedRowsBySection.pinned),
+    ...visibleThreadsOf(activeThreads, groupedRowsBySection.active),
+    ...visibleThreadsOf(visibleWorkingThreads, groupedRowsBySection.working),
+    ...visibleThreadsOf(visibleSnoozedThreads, groupedRowsBySection.snoozed),
+    ...visibleThreadsOf(renderedSettledThreads, groupedRowsBySection.settled),
   ];
   const sectionByThreadKey = new Map<string, SidebarSection>();
   for (const [list, section] of [
@@ -539,6 +646,13 @@ function useSidebarThreads(input: {
     ...partition,
     threads,
     workingShelfEnabled,
+    groupingEnabled,
+    groupedRowsBySection,
+    groupMarkerInfo,
+    toggleProjectGroup: (groupKey: string) =>
+      setCollapsedProjectGroups((keys) => toggleGroupKey(keys, groupKey)),
+    toggleThreadGroup: (threadKey: string) =>
+      setExpandedThreadGroups((keys) => toggleGroupKey(keys, threadKey)),
     searchableThreads: [
       ...pinnedThreads,
       ...activeThreads,
@@ -579,9 +693,18 @@ function useSidebarThreads(input: {
 }
 
 function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
-  const { threads, scopedProjectKeys, serverConfigs, optimisticDrop, workingShelfEnabled } = input;
+  const {
+    threads,
+    scopedProjectKeys,
+    serverConfigs,
+    optimisticDrop,
+    workingShelfEnabled,
+    groupingEnabled,
+  } = input;
   const preciseNow = new Date().toISOString();
-  const visible = filterSidebarV2VisibleThreads(threads, scopedProjectKeys);
+  const visible = filterSidebarV2VisibleThreads(threads, scopedProjectKeys, {
+    includeDelegatedTasks: groupingEnabled,
+  });
   inboxReturns.observe(workingShelfEnabled ? threads : null);
   const pinned: EnvironmentThreadShell[] = [];
   const active: EnvironmentThreadShell[] = [];
@@ -592,7 +715,19 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
   const settled: EnvironmentThreadShell[] = [];
   const draggable = new Set<string>();
   const activeReorderable = new Set<string>();
+  // Delegated tasks are owned by their session: they join its section (and
+  // nest under it) rather than being classified on their own.
+  const delegatedTasks: EnvironmentThreadShell[] = [];
+  const listByThreadKey = new Map<string, EnvironmentThreadShell[]>();
+  const place = (list: EnvironmentThreadShell[], thread: EnvironmentThreadShell) => {
+    list.push(thread);
+    listByThreadKey.set(threadShellKey(thread), list);
+  };
   for (const thread of visible) {
+    if (isSidebarDelegatedTaskThread(thread)) {
+      delegatedTasks.push(thread);
+      continue;
+    }
     const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
     const supportsSettlement = capabilities?.threadSettlement === true;
     const supportsSnooze = capabilities?.threadSnooze === true;
@@ -608,12 +743,12 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         optimisticDrop.occurredAt,
         optimisticDrop.assignedKeys.get(threadKey),
       );
-      (optimisticDrop.section === "pinned"
-        ? pinned
-        : optimisticDrop.section === "settled"
-          ? settled
-          : inbox(projected)
-      ).push(
+      place(
+        optimisticDrop.section === "pinned"
+          ? pinned
+          : optimisticDrop.section === "settled"
+            ? settled
+            : inbox(projected),
         optimisticDrop.clearsSnooze
           ? projected
           : { ...projected, snoozedAt: thread.snoozedAt, snoozedUntil: thread.snoozedUntil },
@@ -624,15 +759,32 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         settled: supportsSettlement && thread.settledOverride === "settled",
         pinned: thread.pinnedAt != null,
       });
-      (section === "snoozed"
-        ? snoozed
-        : section === "settled"
-          ? settled
-          : section === "pinned"
-            ? pinned
-            : inbox(thread)
-      ).push(thread);
+      place(
+        section === "snoozed"
+          ? snoozed
+          : section === "settled"
+            ? settled
+            : section === "pinned"
+              ? pinned
+              : inbox(thread),
+        thread,
+      );
     }
+  }
+  // A delegated task may itself have delegated, so place them until no more
+  // parents resolve. Tasks whose session is hidden (archived, out of scope)
+  // stay hidden too.
+  let pending = delegatedTasks;
+  while (pending.length > 0) {
+    const unresolved: EnvironmentThreadShell[] = [];
+    for (const task of pending) {
+      const parentKey = groupParentShellKey(task);
+      const list = parentKey === null ? undefined : listByThreadKey.get(parentKey);
+      if (list === undefined) unresolved.push(task);
+      else place(list, task);
+    }
+    if (unresolved.length === pending.length) break;
+    pending = unresolved;
   }
   // Server capability only gates DRAGGING — it must not influence the
   // sort, or mixed-version fleets would render different pinned orders on
@@ -1288,6 +1440,85 @@ function SidebarSectionHeader(props: {
   );
 }
 
+function SidebarProjectGroupHeader(props: {
+  marker: SidebarListMarker;
+  project: ProjectFaviconProject | null;
+  label: string;
+  threadCount: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <SortableSidebarMarker
+      marker={props.marker}
+      data-testid="sidebar-project-group-header"
+      className="mx-0.5 mt-1 h-7"
+    >
+      <button
+        type="button"
+        aria-expanded={props.expanded}
+        onClick={props.onToggle}
+        className="flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md px-2 text-left text-xs font-medium text-sidebar-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      >
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("size-3 shrink-0 transition-transform", props.expanded && "rotate-90")}
+        />
+        {props.project ? (
+          <ProjectFavicon project={props.project} className="size-3.5 shrink-0" />
+        ) : (
+          <FolderIcon aria-hidden className="size-3.5 shrink-0" />
+        )}
+        <span className="min-w-0 flex-1 truncate">{props.label}</span>
+        <span className="shrink-0 tabular-nums text-sidebar-muted-foreground/70">
+          {props.threadCount}
+        </span>
+      </button>
+    </SortableSidebarMarker>
+  );
+}
+
+function SidebarThreadChildrenToggle(props: {
+  marker: SidebarListMarker;
+  childCount: number;
+  workingCount: number;
+  attentionCount: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const noun = props.childCount === 1 ? "thread" : "threads";
+  return (
+    <SortableSidebarMarker
+      marker={props.marker}
+      data-testid="sidebar-thread-children-toggle"
+      className="ms-4 h-6"
+    >
+      <button
+        type="button"
+        aria-expanded={props.expanded}
+        onClick={props.onToggle}
+        className="flex h-6 w-full cursor-pointer items-center gap-1.5 rounded-md px-2 text-left text-xs text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      >
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("size-3 shrink-0 transition-transform", props.expanded && "rotate-90")}
+        />
+        <span className="truncate">
+          {props.childCount} {noun} from this session
+        </span>
+        {props.workingCount > 0 ? (
+          <span className="shrink-0 text-info-foreground">· {props.workingCount} working</span>
+        ) : null}
+        {props.attentionCount > 0 ? (
+          <span className="shrink-0 text-warning-foreground">
+            · {props.attentionCount} need{props.attentionCount === 1 ? "s" : ""} you
+          </span>
+        ) : null}
+      </button>
+    </SortableSidebarMarker>
+  );
+}
+
 const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   draftId: DraftId;
   composer: ComposerThreadDraftState;
@@ -1524,6 +1755,8 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
 type SidebarThreadRowProps = {
   thread: SidebarThreadSummary;
   variant: "card" | "slim";
+  /** Nested under its session while grouping; slim rows only. */
+  nested?: boolean;
   variantAction: SidebarSweepAction;
   settlementSupported: boolean;
   snoozeSupported: boolean;
@@ -2065,6 +2298,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
         {...(fileDropHandlers ?? {})}
         className={cn(
           "list-none [content-visibility:auto] [contain-intrinsic-size:auto_36px]",
+          props.nested && "ms-4 border-s border-sidebar-border/60 ps-1",
           sortable?.isDragging && "relative z-20",
         )}
       >
@@ -2939,6 +3173,11 @@ export default function Sidebar() {
   const {
     threads,
     workingShelfEnabled,
+    groupingEnabled,
+    groupedRowsBySection,
+    groupMarkerInfo,
+    toggleProjectGroup,
+    toggleThreadGroup,
     pinnedThreads,
     draggableThreadKeys,
     activeReorderableThreadKeys,
@@ -3498,11 +3737,27 @@ export default function Sidebar() {
     const rowsOf = (
       list: readonly EnvironmentThreadShell[],
       section: SidebarSection,
-    ): SidebarListItem[] =>
-      list.map((thread) => {
-        const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
-        return { kind: "thread", key, section };
+    ): SidebarListItem[] => {
+      const grouped = groupedRowsBySection[section];
+      if (grouped === null) {
+        return list.map((thread) => {
+          const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+          return { kind: "thread", key, section };
+        });
+      }
+      return grouped.map((row): SidebarListItem => {
+        if (row.kind === "project") {
+          return { kind: "marker", marker: `project-group:${row.groupKey}` };
+        }
+        if (row.kind === "children") {
+          return { kind: "marker", marker: `thread-children:${row.parentKey}` };
+        }
+        const key = scopedThreadKey(scopeThreadRef(row.thread.environmentId, row.thread.id));
+        return row.depth === 1
+          ? { kind: "thread", key, section, depth: 1 }
+          : { kind: "thread", key, section };
       });
+    };
     if (
       pinnedThreads.length +
         activeThreads.length +
@@ -3538,7 +3793,11 @@ export default function Sidebar() {
   // list's identity until its order changes, so the sorting strategy, the
   // sortable context and every sortable row stay memoized meanwhile.
   const sidebarListItemsKey = sidebarListItemsFresh
-    .map((item) => (item.kind === "thread" ? item.section + ":" + item.key : item.marker))
+    .map((item) =>
+      item.kind === "thread"
+        ? item.section + ":" + item.key + (item.depth === 1 ? ":nested" : "")
+        : item.marker,
+    )
     .join("\n");
   const [sidebarListItemsState, setSidebarListItems] = useState(sidebarListItemsFresh);
   const [sidebarListItemsKeyState, setSidebarListItemsKeyState] = useState(sidebarListItemsKey);
@@ -4759,12 +5018,14 @@ export default function Sidebar() {
                       const renderThreadRow = (
                         thread: EnvironmentThreadShell,
                         section: SidebarSection,
+                        nested: boolean,
                       ) => {
                         const threadKey = scopedThreadKey(
                           scopeThreadRef(thread.environmentId, thread.id),
                         );
                         const isCard =
-                          section === "active" || section === "pinned" || section === "working";
+                          !nested &&
+                          (section === "active" || section === "pinned" || section === "working");
                         const rowVariant = isCard ? "card" : "slim";
                         return (
                           <SortableThreadRow
@@ -4772,6 +5033,7 @@ export default function Sidebar() {
                             sortableId={threadKey}
                             contextDrag={isContextDrag}
                             sortableDisabled={
+                              groupingEnabled ||
                               renamingThreadKey === threadKey ||
                               section === "working" ||
                               !draggableThreadKeys.has(threadKey) ||
@@ -4779,6 +5041,7 @@ export default function Sidebar() {
                             }
                             thread={thread}
                             variant={rowVariant}
+                            nested={nested}
                             variantAction={
                               section === "snoozed"
                                 ? "unsnooze"
@@ -4879,7 +5142,42 @@ export default function Sidebar() {
                       ];
                       for (const item of sidebarListItems) {
                         if (item.kind === "thread") {
-                          items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
+                          items.push(
+                            renderThreadRow(
+                              threadByKey.get(item.key)!,
+                              item.section,
+                              item.depth === 1,
+                            ),
+                          );
+                          continue;
+                        }
+                        const groupInfo = groupMarkerInfo.get(item.marker);
+                        if (groupInfo?.kind === "project") {
+                          items.push(
+                            <SidebarProjectGroupHeader
+                              key={item.marker}
+                              marker={item.marker}
+                              project={projectByKey.get(groupInfo.projectKey) ?? null}
+                              label={projectDisplayNameByKey.get(groupInfo.projectKey) ?? "Project"}
+                              threadCount={groupInfo.threadCount}
+                              expanded={groupInfo.expanded}
+                              onToggle={() => toggleProjectGroup(groupInfo.groupKey)}
+                            />,
+                          );
+                          continue;
+                        }
+                        if (groupInfo?.kind === "children") {
+                          items.push(
+                            <SidebarThreadChildrenToggle
+                              key={item.marker}
+                              marker={item.marker}
+                              childCount={groupInfo.childCount}
+                              workingCount={groupInfo.workingCount}
+                              attentionCount={groupInfo.attentionCount}
+                              expanded={groupInfo.expanded}
+                              onToggle={() => toggleThreadGroup(groupInfo.parentKey)}
+                            />,
+                          );
                           continue;
                         }
                         switch (item.marker) {

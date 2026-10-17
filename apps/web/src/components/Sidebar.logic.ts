@@ -139,14 +139,26 @@ export type SidebarListMarker =
   | "pinned-divider"
   | "working-header"
   | "snoozed-header"
-  | "settled-header";
+  | "settled-header"
+  // Thread grouping: a project header, keyed `${section}:${projectKey}`, and
+  // the toggle under a session row that owns nested threads, keyed by the
+  // session's thread key. Drag is off while grouping, so the drop logic never
+  // has to place rows around these.
+  | `project-group:${string}`
+  | `thread-children:${string}`;
 
 export function sidebarMarkerId(marker: SidebarListMarker): string {
   return `${SIDEBAR_MARKER_PREFIX}${marker}`;
 }
 
 export type SidebarListItem =
-  | { readonly kind: "thread"; readonly key: string; readonly section: SidebarSection }
+  | {
+      readonly kind: "thread";
+      readonly key: string;
+      readonly section: SidebarSection;
+      /** 1 for a thread nested under its session while grouping. */
+      readonly depth?: 1;
+    }
   | { readonly kind: "marker"; readonly marker: SidebarListMarker };
 
 export function sidebarListItemId(item: SidebarListItem): string {
@@ -515,19 +527,159 @@ export function isSidebarSubagentThread(thread: Pick<SidebarThreadSummary, "line
   return thread.lineage.relationshipToParent === "subagent";
 }
 
+type SidebarLineageThread = Pick<SidebarThreadSummary, "lineage"> & {
+  readonly source?: Pick<SidebarThreadSummary["source"], "creationSource">;
+};
+
+/**
+ * A child task an agent delegated through T3 (`delegate_task`). Provider-native
+ * subagents share the "subagent" relationship but are created by the provider
+ * and stay hidden.
+ */
+export function isSidebarDelegatedTaskThread(thread: SidebarLineageThread): boolean {
+  return isSidebarSubagentThread(thread) && thread.source?.creationSource === "mcp";
+}
+
+/**
+ * The session a thread nests under when grouping: the delegating parent of a
+ * delegated task, or the thread whose agent launched it as a top-level thread.
+ */
+export function sidebarGroupParentThreadId(thread: SidebarLineageThread): ThreadId | null {
+  if (isSidebarDelegatedTaskThread(thread)) return thread.lineage.parentThreadId;
+  return thread.lineage.launchedByThreadId ?? null;
+}
+
 export function filterSidebarV2VisibleThreads<
   T extends Pick<SidebarThreadSummary, "archivedAt" | "lineage"> & {
     environmentId: string;
     projectId: string;
+    source?: Pick<SidebarThreadSummary["source"], "creationSource">;
   },
->(threads: readonly T[], scopedProjectKeys: ReadonlySet<string> | null): T[] {
+>(
+  threads: readonly T[],
+  scopedProjectKeys: ReadonlySet<string> | null,
+  options?: { readonly includeDelegatedTasks?: boolean },
+): T[] {
+  const includeDelegatedTasks = options?.includeDelegatedTasks === true;
   return threads.filter(
     (thread) =>
       thread.archivedAt === null &&
-      !isSidebarSubagentThread(thread) &&
+      (!isSidebarSubagentThread(thread) ||
+        (includeDelegatedTasks && isSidebarDelegatedTaskThread(thread))) &&
       (scopedProjectKeys === null ||
         scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
   );
+}
+
+export type SidebarGroupedRow<T, K extends string = string> =
+  | {
+      readonly kind: "project";
+      /** `${section}:${projectKey}`; collapse state is per section. */
+      readonly groupKey: string;
+      readonly projectKey: K;
+      readonly threadCount: number;
+      readonly expanded: boolean;
+    }
+  | { readonly kind: "thread"; readonly thread: T; readonly depth: 0 | 1 }
+  | {
+      readonly kind: "children";
+      readonly parentKey: string;
+      readonly children: readonly T[];
+      readonly expanded: boolean;
+    };
+
+/**
+ * Groups one sidebar section's already-sorted threads: top-level rows under a
+ * header per project, and every thread
+ * whose group parent is in the same section nested under its topmost such
+ * ancestor. Nesting is one level deep, so a delegated task's own delegated
+ * tasks sit beside it under the root session. A session group sorts at its
+ * highest-ranked member, and a project at its highest-ranked group, so a busy
+ * delegated task lifts its session and project. Collapsed projects and session
+ * groups omit their rows, except that the group holding `revealKey` (the open
+ * thread) is always expanded.
+ */
+export function groupSidebarSectionThreads<T, K extends string>(
+  threads: readonly T[],
+  input: {
+    readonly section: SidebarSection;
+    readonly keyOf: (thread: T) => string;
+    readonly groupParentKeyOf: (thread: T) => string | null;
+    readonly projectKeyOf: (thread: T) => K;
+    readonly collapsedProjectGroups: ReadonlySet<string>;
+    readonly expandedThreadGroups: ReadonlySet<string>;
+    readonly revealKey: string | null;
+  },
+): SidebarGroupedRow<T, K>[] {
+  const { keyOf, groupParentKeyOf, projectKeyOf } = input;
+  const byKey = new Map(threads.map((thread) => [keyOf(thread), thread] as const));
+  const anchorKeyOf = (thread: T): string | null => {
+    let anchor: string | null = null;
+    let current = thread;
+    const seen = new Set([keyOf(thread)]);
+    for (;;) {
+      const parentKey = groupParentKeyOf(current);
+      if (parentKey === null || seen.has(parentKey)) return anchor;
+      const parent = byKey.get(parentKey);
+      if (parent === undefined) return anchor;
+      seen.add(parentKey);
+      anchor = parentKey;
+      current = parent;
+    }
+  };
+  const roots: T[] = [];
+  const childrenByAnchor = new Map<string, T[]>();
+  const groupRank = new Map<string, number>();
+  for (const [index, thread] of threads.entries()) {
+    const anchor = anchorKeyOf(thread);
+    const groupKey = anchor ?? keyOf(thread);
+    if (!groupRank.has(groupKey)) groupRank.set(groupKey, index);
+    if (anchor === null) {
+      roots.push(thread);
+      continue;
+    }
+    const children = childrenByAnchor.get(anchor);
+    if (children === undefined) childrenByAnchor.set(anchor, [thread]);
+    else children.push(thread);
+  }
+  roots.sort((left, right) => groupRank.get(keyOf(left))! - groupRank.get(keyOf(right))!);
+  const rootsByProject = new Map<K, T[]>();
+  for (const root of roots) {
+    const projectKey = projectKeyOf(root);
+    const projectRoots = rootsByProject.get(projectKey);
+    if (projectRoots === undefined) rootsByProject.set(projectKey, [root]);
+    else projectRoots.push(root);
+  }
+  const revealThread = input.revealKey === null ? undefined : byKey.get(input.revealKey);
+  const revealAnchorKey =
+    revealThread === undefined ? null : (anchorKeyOf(revealThread) ?? input.revealKey);
+  const revealAnchor = revealAnchorKey === null ? undefined : byKey.get(revealAnchorKey);
+  const revealProjectKey = revealAnchor === undefined ? null : projectKeyOf(revealAnchor);
+
+  const rows: SidebarGroupedRow<T, K>[] = [];
+  for (const [projectKey, projectRoots] of rootsByProject) {
+    const groupKey = `${input.section}:${projectKey}`;
+    const expanded = !input.collapsedProjectGroups.has(groupKey) || projectKey === revealProjectKey;
+    let threadCount = 0;
+    for (const root of projectRoots) {
+      threadCount += 1 + (childrenByAnchor.get(keyOf(root))?.length ?? 0);
+    }
+    rows.push({ kind: "project", groupKey, projectKey, threadCount, expanded });
+    if (!expanded) continue;
+    for (const root of projectRoots) {
+      rows.push({ kind: "thread", thread: root, depth: 0 });
+      const rootKey = keyOf(root);
+      const children = childrenByAnchor.get(rootKey);
+      if (children === undefined) continue;
+      const childrenExpanded =
+        input.expandedThreadGroups.has(rootKey) ||
+        (revealAnchorKey === rootKey && input.revealKey !== rootKey);
+      rows.push({ kind: "children", parentKey: rootKey, children, expanded: childrenExpanded });
+      if (!childrenExpanded) continue;
+      for (const child of children) rows.push({ kind: "thread", thread: child, depth: 1 });
+    }
+  }
+  return rows;
 }
 
 export function getSidebarForkParentThreadId(
