@@ -12,6 +12,7 @@ import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as CheckpointCaptureService from "./CheckpointCaptureService.ts";
@@ -314,6 +315,8 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
       layerRuntimeRequestServiceProvided,
       layerThreadTitleRegenerationProvided,
       layerThreadManagementProvided,
+      ProjectStore.layer,
+      ProcessRunner.layer,
     ),
   ),
 );

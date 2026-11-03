@@ -98,6 +98,12 @@ import {
   runOutcome,
 } from "./RestartBackgroundNote.ts";
 import {
+  providerRetryCommandId,
+  providerRetryEffectId,
+  providerRetryPlan,
+  providerRetryReleaseEffectId,
+} from "./DelegatedProviderRetry.ts";
+import {
   isBufferedProviderNotification,
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
@@ -4599,8 +4605,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
 
+      if (command.providerRetryOfRunId !== undefined) {
+        const source = projection.runs.find((run) => run.id === command.providerRetryOfRunId);
+        if (
+          source?.status !== "failed" ||
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          projection.thread.providerInstanceId !== source.providerInstanceId ||
+          projection.runs.some(
+            (run) =>
+              run.id !== source.id &&
+              run.status !== "queued" &&
+              !cancelledBeforeStart(run) &&
+              runRanAfter(run, source),
+          ) ||
+          (yield* stopReachedRun(command, command.threadId, source.id)) ||
+          Option.exists(
+            yield* effectOutbox
+              .get(providerRetryEffectId(source.id))
+              .pipe(mapDispatchError(command)),
+            (effect) => effect.status === "cancelled",
+          )
+        ) {
+          // Accepted without effect, as a stale restart continuation is, so the
+          // retry effect settles and the task is finalized from its source run.
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: projection.thread,
+          });
+          return;
+        }
+      }
+
+      const continuedRunId = command.restartContinuationOfRunId ?? command.providerRetryOfRunId;
       const continuedTaskId = projection.runs.find(
-        (run) => run.id === command.restartContinuationOfRunId,
+        (run) => run.id === continuedRunId,
       )?.delegatedTaskId;
 
       if (projection.thread.settledOverride !== null) {
@@ -4715,7 +4759,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (command.creationSource !== "server" && command.creationSource !== "provider") ||
           (dispatchMode.type !== "queue_after_active" &&
             !(
-              command.restartContinuationOfRunId !== undefined &&
+              (command.restartContinuationOfRunId !== undefined ||
+                command.providerRetryOfRunId !== undefined) &&
               dispatchMode.type === "start_immediately"
             )))
       ) {
@@ -5039,6 +5084,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.restartContinuationOfRunId === undefined
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+          ...(command.providerRetryOfRunId === undefined
+            ? {}
+            : { providerRetryOfRunId: command.providerRetryOfRunId }),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -5379,6 +5427,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.restartContinuationOfRunId === undefined
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+          ...(command.providerRetryOfRunId === undefined
+            ? {}
+            : { providerRetryOfRunId: command.providerRetryOfRunId }),
           ...(dispatchMode.type === "defer_start" && dispatchMode.workspaceStrategy !== undefined
             ? { workspacePreparation: dispatchMode.workspaceStrategy }
             : {}),
@@ -6076,6 +6127,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.restartContinuationOfRunId === undefined
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+        ...(command.providerRetryOfRunId === undefined
+          ? {}
+          : { providerRetryOfRunId: command.providerRetryOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...wakeWorkStartedAt(projection.runs, command),
       };
@@ -6812,6 +6866,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.scheduledTaskId !== undefined ||
       command.notification !== undefined ||
       command.restartContinuationOfRunId !== undefined ||
+      command.providerRetryOfRunId !== undefined ||
       (command.createdBy !== "user" && command.creationSource !== "mcp")
     )
       return;
@@ -9527,7 +9582,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* markStoppedRun({ command, events, thread: projection.thread, run, now });
       }
       yield* holdStoppedThread({ command, events, projection, cohortRunIds: [], now });
-      return undefined;
+      const pendingRetry =
+        executed === null
+          ? Option.none()
+          : yield* effectOutbox
+              .get(providerRetryEffectId(executed.id))
+              .pipe(mapDispatchError(command));
+      if (
+        executed === null ||
+        !Option.exists(
+          pendingRetry,
+          (effect) => effect.status === "pending" || effect.status === "running",
+        )
+      ) {
+        return undefined;
+      }
+      // Stop ends a provider-retry wait at once: the continuation is cancelled,
+      // and the unchanged terminal run is announced again so its delegated task
+      // settles now instead of when the wait would have ended.
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: executed.id,
+        ...(executed.rootNodeId === null ? {} : { nodeId: executed.rootNodeId }),
+        providerInstanceId: executed.providerInstanceId,
+        occurredAt: now,
+        payload: executed,
+      });
+      return {
+        effectTypes: ["provider-runtime.retry"],
+        reason: `Run ${executed.id} was stopped while it waited to be continued after a provider failure.`,
+      } satisfies {
+        readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+        readonly reason: string;
+      };
     });
 
   const dispatchCheckpointRollback = (
@@ -9763,6 +9854,100 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
 
+  const providerRetryPlanForRun = (
+    run: OrchestrationV2Run,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) =>
+    Effect.gen(function* () {
+      const { turnItems } = yield* projectionStore.getThreadRecords(run.threadId, ["turnItems"], {
+        turnItemRunIds: [run.id],
+        turnItemTypes: ["error", "run_interrupt_request"],
+      });
+      return providerRetryPlan({
+        run,
+        runs,
+        failure: latestRootProviderFailure(run, turnItems),
+        stopped: turnItems.some((item) => item.type === "run_interrupt_request"),
+        now: yield* DateTime.now,
+      });
+    });
+
+  // Before its effect is written, a run that will be retried already counts as
+  // held, so no reader sees the failure the retry may still turn into a result.
+  const awaitsProviderRetry = (run: OrchestrationV2Run, runs: ReadonlyArray<OrchestrationV2Run>) =>
+    Effect.gen(function* () {
+      if (run.status !== "failed") return false;
+      const effect = yield* effectOutbox.get(providerRetryEffectId(run.id));
+      if (Option.isSome(effect)) {
+        return effect.value.status === "pending" || effect.value.status === "running";
+      }
+      return (yield* providerRetryPlanForRun(run, runs)) !== null;
+    });
+
+  /** Writes the delayed continuation of a delegated child's run that a passing provider failure cut off. */
+  const scheduleProviderRetry = (
+    run: OrchestrationV2Run,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) =>
+    Effect.gen(function* () {
+      if (run.status !== "failed") return;
+      const effectId = providerRetryEffectId(run.id);
+      if (Option.isSome(yield* effectOutbox.get(effectId))) return;
+      const plan = yield* providerRetryPlanForRun(run, runs);
+      if (plan === null) return;
+      const commandId = CommandId.make(providerRetryCommandId(run.id));
+      yield* eventSink.writeWithEffects({
+        commandId,
+        events: [],
+        effects: [
+          {
+            id: effectId,
+            commandId,
+            threadId: run.threadId,
+            request: { type: "provider-runtime.retry", sourceRunId: run.id },
+            availableAt: plan.availableAt,
+          },
+        ],
+      });
+      yield* Effect.logInfo("orchestration-v2.provider-retry.scheduled", {
+        threadId: run.threadId,
+        runId: run.id,
+        cuts: plan.cuts,
+        reason: plan.reason,
+        availableAt: DateTime.formatIso(plan.availableAt),
+      });
+    });
+
+  /**
+   * Once a task whose child a provider retry touched has settled, writes the effect that drops the workspace's record of
+   * the child's outward steps. A retry that was scheduled may have armed it even if no continuation run followed.
+   */
+  const releaseProviderRetryGuard = (
+    settledRun: OrchestrationV2Run,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) =>
+    Effect.gen(function* () {
+      const effectId = providerRetryReleaseEffectId(settledRun.id);
+      if (Option.isSome(yield* effectOutbox.get(effectId))) return;
+      const retried =
+        runs.some((run) => run.providerRetryOfRunId !== undefined) ||
+        Option.isSome(yield* effectOutbox.get(providerRetryEffectId(settledRun.id)));
+      if (!retried) return;
+      const commandId = CommandId.make(`command:provider-retry-release:${settledRun.id}`);
+      yield* eventSink.writeWithEffects({
+        commandId,
+        events: [],
+        effects: [
+          {
+            id: effectId,
+            commandId,
+            threadId: settledRun.threadId,
+            request: { type: "provider-runtime.retry-release", settledRunId: settledRun.id },
+          },
+        ],
+      });
+    });
+
   const childAwaitsRestartContinuation = (
     runs: ReadonlyArray<OrchestrationV2Run>,
     resultRun: OrchestrationV2Run,
@@ -9774,7 +9959,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           run.id !== settledContinuationOf &&
           (run.id === resultRun.id || runRanAfter(run, resultRun)),
       ),
-      awaitsRestartContinuation,
+      (run) =>
+        awaitsRestartContinuation(run).pipe(
+          Effect.flatMap((pending) =>
+            pending ? Effect.succeed(true) : awaitsProviderRetry(run, runs),
+          ),
+        ),
     ).pipe(Effect.map((pending) => pending.includes(true)));
 
   const planDelegatedCompletionDelivery = Effect.fn(
@@ -10011,6 +10201,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const terminalStatus = delegatedTaskTerminalStatus(outcome);
       if (terminalStatus === null) {
         return;
+      }
+      if (childRun.id !== options.settledContinuationOf) {
+        yield* scheduleProviderRetry(
+          childRun,
+          taskRuns.length === 0 ? childControls.runs : taskRuns,
+        );
       }
       if (
         yield* childAwaitsRestartContinuation(
@@ -10275,6 +10471,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       ]);
 
+      yield* releaseProviderRetryGuard(
+        childRun,
+        taskRuns.length === 0 ? childControls.runs : taskRuns,
+      );
       if (completionPlan.offer && completionPlan.parentRun !== undefined) {
         yield* offerDelegatedCompletionDelivery(parentThreadId, completionPlan.parentRun.id);
       }
