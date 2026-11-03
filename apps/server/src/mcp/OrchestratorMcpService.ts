@@ -2221,9 +2221,22 @@ const make = Effect.gen(function* () {
           } satisfies OrchestratorMcpTaskCancelResult;
         }
         const child = yield* loadProjection(current.childThreadId);
+        // A child whose cut-off run waits to be continued (after a restart or a
+        // passing provider failure) has no live run, yet Stop still ends the wait.
+        const awaitingContinuation =
+          ThreadManagementService.latestActiveRun(child) === undefined &&
+          child.runs.some((run) => run.status === "failed" || run.status === "cancelled") &&
+          parentTask !== undefined &&
+          (yield* threadManagement
+            .delegatedTaskResultPending(
+              current.childThreadId,
+              delegatedTaskRun(child, parentTask)?.delegatedTaskId,
+            )
+            .pipe(Effect.mapError(threadManagementFailure)));
         if (
           current.workState !== "waiting_for_children" &&
-          ThreadManagementService.latestActiveRun(child) === undefined
+          ThreadManagementService.latestActiveRun(child) === undefined &&
+          !awaitingContinuation
         ) {
           return yield* failure(
             "task_not_cancellable",

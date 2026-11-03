@@ -7,7 +7,9 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import {
@@ -27,7 +29,15 @@ import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ServerConfig from "../config.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import {
+  continueAfterProviderFailure,
+  type ListCompletedOutwardSteps,
+  workspaceResumeGuard,
+} from "./ProviderRetryContinuation.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -97,6 +107,23 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    // Optional so executors built without process access still continue
+    // provider-cut runs, only without the workspace's record of their steps.
+    const guardServices = Option.all({
+      processRunner: yield* Effect.serviceOption(ProcessRunner.ProcessRunner),
+      fileSystem: yield* Effect.serviceOption(FileSystem.FileSystem),
+      path: yield* Effect.serviceOption(Path.Path),
+      projects: yield* Effect.serviceOption(ProjectStore.ProjectStoreV2),
+    });
+    const serverConfig = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+    const listCompletedOutwardSteps: ListCompletedOutwardSteps | undefined = Option.isSome(
+      guardServices,
+    )
+      ? workspaceResumeGuard({
+          ...guardServices.value,
+          stateDbPath: Option.getOrUndefined(serverConfig)?.dbPath,
+        })
+      : undefined;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
@@ -106,6 +133,29 @@ export const layerExecutor: Layer.Layer<
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              Effect.tapError(() =>
+                willRetry
+                  ? Effect.void
+                  : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
+          }
+          case "provider-runtime.retry": {
+            const sourceRunId = effect.request.sourceRunId;
+            return continueAfterProviderFailure({
+              threadId: effect.threadId,
+              sourceRunId,
+              ...(listCompletedOutwardSteps === undefined ? {} : { listCompletedOutwardSteps }),
+            }).pipe(
+              Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.tapError(() =>
                 willRetry
                   ? Effect.void

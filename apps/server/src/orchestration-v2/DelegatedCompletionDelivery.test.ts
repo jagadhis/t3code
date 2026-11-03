@@ -39,6 +39,9 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import { continueAfterProviderFailure, ResumeGuardError } from "./ProviderRetryContinuation.ts";
+import { providerRetryEffectId } from "./DelegatedProviderRetry.ts";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as RuntimeLayer from "./runtimeLayer.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -133,7 +136,7 @@ const layerTest = Layer.mergeAll(RuntimeLayer.layer, RuntimeLayer.layerEventSink
   ),
   Layer.provide(McpSessionRegistryTestkit.layer),
   Layer.provide(McpProviderSessions.layer),
-  Layer.provide(SqlitePersistence.layerMemory),
+  Layer.provideMerge(SqlitePersistence.layerMemory),
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
@@ -811,7 +814,7 @@ const seedRestartCancelledChild = (input: {
   readonly name: string;
   readonly completionWake: "always" | "settled_only";
   readonly continuationPending: boolean;
-  readonly runStatus?: "cancelled" | "completed";
+  readonly runStatus?: "cancelled" | "completed" | "running";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
   readonly now: DateTime.Utc;
 }) =>
@@ -1928,6 +1931,350 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
         projection.runs.find((row) => row.id === runId)?.delegatedCompletion?.delivery?.taskIds,
         [child.taskId],
       );
+    }),
+  );
+});
+
+const cutByProvider = (input: {
+  readonly run: OrchestrationV2Run;
+  readonly failure: { readonly class: "provider_error" | "transport_error"; readonly code: string };
+  readonly now: DateTime.Utc;
+}) =>
+  Effect.gen(function* () {
+    const eventSink = yield* EventSink.EventSinkV2;
+    yield* eventSink.write({
+      commandId: CommandId.make(`command:provider-cut:${input.run.id}`),
+      events: [
+        {
+          id: EventId.make(`event:provider-cut:${input.run.id}:error`),
+          type: "turn-item.updated",
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: input.now,
+          payload: {
+            id: TurnItemId.make(`turn-item:provider-cut:${input.run.id}`),
+            type: "error",
+            threadId: input.run.threadId,
+            runId: input.run.id,
+            nodeId: input.run.rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "failed",
+            title: "Provider failure",
+            startedAt: input.now,
+            completedAt: input.now,
+            updatedAt: input.now,
+            failure: {
+              ...input.failure,
+              message: "The provider failed the request.",
+              retryable: null,
+            },
+          },
+        },
+        {
+          id: EventId.make(`event:provider-cut:${input.run.id}:failed`),
+          type: "run.updated",
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: input.now,
+          payload: {
+            ...input.run,
+            status: "failed",
+            startedAt: input.run.startedAt ?? input.now,
+            completedAt: input.now,
+          },
+        },
+      ],
+    });
+  });
+
+const OVERLOADED = { class: "provider_error", code: "overloaded_error" } as const;
+
+it.layer(layerTest)("delegated provider retry", (it) => {
+  const seedCutChild = (name: string) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make(`thread:${name}-parent`);
+      const runId = RunId.make(`run:${name}-parent`);
+      const rootNodeId = NodeId.make(`node:${name}-parent-root`);
+      yield* seedParentWithTerminalTask({
+        threadId,
+        projectId: ProjectId.make(`project:${name}`),
+        runId,
+        rootNodeId,
+        taskId: NodeId.make(`node:${name}-settled`),
+        deliveryState: "delivered",
+        now,
+      });
+      const child = yield* seedRestartCancelledChild({
+        parentThreadId: threadId,
+        projectId: ProjectId.make(`project:${name}`),
+        parentRunId: runId,
+        rootNodeId,
+        name: `${name}-child`,
+        completionWake: "always",
+        continuationPending: false,
+        runStatus: "running",
+        now,
+      });
+      const childRun = (yield* orchestrator.getThreadProjection(child.childThreadId)).runs[0]!;
+      return { now, parentThreadId: threadId, parentRunId: runId, child, childRun };
+    });
+
+  const taskOf = (parentThreadId: ThreadId, taskId: NodeId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      return (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+        (task) => task.id === taskId,
+      )!;
+    });
+
+  const deliveredTaskIds = (parentThreadId: ThreadId, parentRunId: RunId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      return (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+        (run) => run.id === parentRunId,
+      )?.delegatedCompletion?.delivery?.taskIds;
+    });
+
+  const deliveryOf = (parentThreadId: ThreadId, parentRunId: RunId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      return (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+        (run) => run.id === parentRunId,
+      )?.delegatedCompletion;
+    });
+
+  /** A further recovery pass must not wake the parent a second time. */
+  const assertWokenOnce = (parentThreadId: ThreadId, parentRunId: RunId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const woken = yield* deliveryOf(parentThreadId, parentRunId);
+      assert.isNotNull(woken?.delivery ?? null);
+      yield* orchestrator.recoverDelegatedTasks;
+      assert.deepEqual(yield* deliveryOf(parentThreadId, parentRunId), woken);
+    });
+
+  const retryEffect = (runId: RunId) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly status: string; readonly available_at: string }>`
+        SELECT status, available_at FROM orchestration_v2_effect_outbox
+        WHERE effect_id = ${providerRetryEffectId(runId)}
+      `;
+      const row = rows[0];
+      return row === undefined ? undefined : { status: row.status, availableAt: row.available_at };
+    });
+
+  /** Runs the due continuation as the effect worker would, and returns the run it started. */
+  const continueCut = (childThreadId: ThreadId, sourceRunId: RunId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* continueAfterProviderFailure({ threadId: childThreadId, sourceRunId });
+      return (yield* orchestrator.getThreadProjection(childThreadId)).runs.find(
+        (run) => run.providerRetryOfRunId === sourceRunId,
+      );
+    });
+
+  it.effect(
+    "holds the task through a passing failure and wakes the parent once with the result",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const seeded = yield* seedCutChild("provider-retry-success");
+        const { child, now } = seeded;
+
+        yield* cutByProvider({ run: seeded.childRun, failure: OVERLOADED, now });
+        yield* orchestrator.recoverDelegatedTasks;
+
+        const held = yield* taskOf(seeded.parentThreadId, child.taskId);
+        assert.equal(held.status, "running");
+        assert.isNull(held.result);
+        assert.isUndefined(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId));
+        const effect = yield* retryEffect(seeded.childRun.id);
+        assert.equal(effect?.status, "pending");
+        assert.equal(effect?.availableAt, DateTime.formatIso(DateTime.add(now, { minutes: 1 })));
+
+        const continued = yield* continueCut(child.childThreadId, seeded.childRun.id);
+        assert.isDefined(continued);
+        assert.equal(continued!.delegatedTaskId, seeded.childRun.delegatedTaskId);
+        const message = (yield* orchestrator.getThreadProjection(
+          child.childThreadId,
+        )).messages.find((row) => row.id === continued!.userMessageId);
+        assert.include(
+          message?.text ?? "",
+          "cut off by the model's provider (provider overloaded)",
+        );
+        assert.isNull((yield* taskOf(seeded.parentThreadId, child.taskId)).result);
+
+        yield* eventSink.write({
+          commandId: CommandId.make("command:provider-retry-success:finished"),
+          events: [
+            {
+              id: EventId.make("event:provider-retry-success:finished"),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              runId: continued!.id,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: { ...continued!, status: "completed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+
+        const finished = yield* taskOf(seeded.parentThreadId, child.taskId);
+        assert.equal(finished.status, "completed");
+        assert.equal(finished.completionDelivery?.state, "claimed");
+        assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
+          child.taskId,
+        ]);
+        yield* assertWokenOnce(seeded.parentThreadId, seeded.parentRunId);
+      }),
+  );
+
+  it.effect(
+    "continues after 1, 2, 4 and 8 minutes and wakes the parent once when the fifth try fails",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const seeded = yield* seedCutChild("provider-retry-exhaust");
+        const { child, now } = seeded;
+        const waits: Array<string | undefined> = [];
+        let run = seeded.childRun;
+        for (let attempt = 1; attempt <= 5; attempt += 1) {
+          yield* cutByProvider({ run, failure: OVERLOADED, now });
+          yield* orchestrator.recoverDelegatedTasks;
+          if (attempt === 5) break;
+          assert.isNull((yield* taskOf(seeded.parentThreadId, child.taskId)).result);
+          waits.push((yield* retryEffect(run.id))?.availableAt);
+          run = (yield* continueCut(child.childThreadId, run.id))!;
+          assert.isDefined(run);
+        }
+
+        assert.deepEqual(
+          waits,
+          [1, 2, 4, 8].map((minutes) => DateTime.formatIso(DateTime.add(now, { minutes }))),
+        );
+        assert.isUndefined(yield* retryEffect(run.id));
+        const failed = yield* taskOf(seeded.parentThreadId, child.taskId);
+        assert.equal(failed.status, "failed");
+        assert.equal(failed.completionDelivery?.state, "claimed");
+        assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
+          child.taskId,
+        ]);
+        assert.include(failed.result ?? "", "The provider failed the request.");
+        assert.lengthOf((yield* orchestrator.getThreadProjection(child.childThreadId)).runs, 5);
+        yield* assertWokenOnce(seeded.parentThreadId, seeded.parentRunId);
+      }),
+  );
+
+  it.effect("fails the task at once on a lasting failure", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const seeded = yield* seedCutChild("provider-retry-lasting");
+      yield* cutByProvider({
+        run: seeded.childRun,
+        failure: { class: "provider_error", code: "authentication_failed" },
+        now: seeded.now,
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+
+      assert.isUndefined(yield* retryEffect(seeded.childRun.id));
+      const failed = yield* taskOf(seeded.parentThreadId, seeded.child.taskId);
+      assert.equal(failed.status, "failed");
+      assert.equal(failed.completionDelivery?.state, "claimed");
+      assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
+        seeded.child.taskId,
+      ]);
+      assert.include(failed.result ?? "", "The provider failed the request.");
+      assert.lengthOf(
+        (yield* orchestrator.getThreadProjection(seeded.child.childThreadId)).runs,
+        1,
+      );
+      yield* assertWokenOnce(seeded.parentThreadId, seeded.parentRunId);
+    }),
+  );
+
+  it.effect("ends the wait when the task is stopped, and never continues it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const seeded = yield* seedCutChild("provider-retry-stopped");
+      const { child } = seeded;
+      yield* cutByProvider({ run: seeded.childRun, failure: OVERLOADED, now: seeded.now });
+      yield* orchestrator.recoverDelegatedTasks;
+      assert.equal((yield* retryEffect(seeded.childRun.id))?.status, "pending");
+
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("command:provider-retry-stopped:stop"),
+        threadId: child.childThreadId,
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+
+      assert.equal((yield* retryEffect(seeded.childRun.id))?.status, "cancelled");
+      const stopped = yield* taskOf(seeded.parentThreadId, child.taskId);
+      assert.equal(stopped.status, "failed");
+      assert.isNotNull(stopped.result);
+      assert.isUndefined(yield* continueCut(child.childThreadId, seeded.childRun.id));
+      assert.lengthOf((yield* orchestrator.getThreadProjection(child.childThreadId)).runs, 1);
+    }),
+  );
+
+  it.effect("tells the continued child which outward steps it already completed", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const seeded = yield* seedCutChild("provider-retry-guarded");
+      const { child } = seeded;
+      yield* cutByProvider({ run: seeded.childRun, failure: OVERLOADED, now: seeded.now });
+      yield* orchestrator.recoverDelegatedTasks;
+
+      yield* continueAfterProviderFailure({
+        threadId: child.childThreadId,
+        sourceRunId: seeded.childRun.id,
+        listCompletedOutwardSteps: () => Effect.succeed(["gh pr comment 12 --body done"]),
+      });
+      const projection = yield* orchestrator.getThreadProjection(child.childThreadId);
+      const continued = projection.runs.find(
+        (run) => run.providerRetryOfRunId === seeded.childRun.id,
+      );
+      assert.isDefined(continued);
+      const text =
+        projection.messages.find((row) => row.id === continued!.userMessageId)?.text ?? "";
+      assert.include(text, "- gh pr comment 12 --body done");
+      assert.include(text, "an exact repeat is blocked");
+    }),
+  );
+
+  it.effect("fails the task instead of continuing when its outward steps cannot be recorded", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const seeded = yield* seedCutChild("provider-retry-unguarded");
+      const { child } = seeded;
+      yield* cutByProvider({ run: seeded.childRun, failure: OVERLOADED, now: seeded.now });
+      yield* orchestrator.recoverDelegatedTasks;
+
+      yield* continueAfterProviderFailure({
+        threadId: child.childThreadId,
+        sourceRunId: seeded.childRun.id,
+        listCompletedOutwardSteps: () =>
+          Effect.fail(new ResumeGuardError({ detail: "resume-guard arm exited 1" })),
+      });
+
+      assert.lengthOf((yield* orchestrator.getThreadProjection(child.childThreadId)).runs, 1);
+      const failed = yield* taskOf(seeded.parentThreadId, child.taskId);
+      assert.equal(failed.status, "failed");
+      assert.include(failed.result ?? "", "The provider failed the request.");
+      assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
+        child.taskId,
+      ]);
     }),
   );
 });
