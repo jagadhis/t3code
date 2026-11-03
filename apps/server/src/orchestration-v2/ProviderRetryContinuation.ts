@@ -43,6 +43,16 @@ export type ListCompletedOutwardSteps = (input: {
   readonly source: OrchestrationV2Run;
 }) => Effect.Effect<ReadonlyArray<string> | null, ResumeGuardError>;
 
+/** Drops the record `ListCompletedOutwardSteps` made for a thread, so later turns may repeat those steps again. */
+export type ReleaseOutwardSteps = (input: {
+  readonly thread: OrchestrationV2AppThread;
+}) => Effect.Effect<void, ResumeGuardError>;
+
+export interface ResumeGuard {
+  readonly listCompletedOutwardSteps: ListCompletedOutwardSteps;
+  readonly releaseOutwardSteps: ReleaseOutwardSteps;
+}
+
 const RESUME_GUARD_SCRIPT = ".agents/scripts/resume-guard.ts";
 const decodeArmOutput = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ done: Schema.Array(Schema.String) })),
@@ -51,19 +61,18 @@ const decodeArmOutput = Schema.decodeUnknownEffect(
 /**
  * A workspace may carry `.agents/scripts/resume-guard.ts`, as Cockpit's station runs use it: `arm` reads the thread's
  * completed tool calls from T3's state, keeps the outward ones and records them, so the workspace's tool hook denies an
- * exact repeat in that thread, and prints them for the continue message. It is looked up in the main checkout, where
- * the hook reads it for every worktree.
+ * exact repeat in that thread, and prints them for the continue message; `disarm` removes that record once the task
+ * settles. It is looked up in the main checkout, where the hook reads it for every worktree.
  */
-export const workspaceResumeGuard =
-  (services: {
-    readonly processRunner: ProcessRunner.ProcessRunner["Service"];
-    readonly fileSystem: FileSystem.FileSystem;
-    readonly path: Path.Path;
-    readonly projects: ProjectStore.ProjectStoreV2["Service"];
-    /** This server's state database, which the script reads; it defaults to the live install's. */
-    readonly stateDbPath?: string | undefined;
-  }): ListCompletedOutwardSteps =>
-  ({ thread, source }) =>
+export const workspaceResumeGuard = (services: {
+  readonly processRunner: ProcessRunner.ProcessRunner["Service"];
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly projects: ProjectStore.ProjectStoreV2["Service"];
+  /** This server's state database, which the script reads; it defaults to the live install's. */
+  readonly stateDbPath?: string | undefined;
+}): ResumeGuard => {
+  const locate = (thread: OrchestrationV2AppThread) =>
     Effect.gen(function* () {
       const cwd =
         thread.worktreePath ??
@@ -87,11 +96,19 @@ export const workspaceResumeGuard =
       if (!(yield* services.fileSystem.exists(script).pipe(Effect.orElseSucceed(() => false)))) {
         return null;
       }
-      const armed = yield* services.processRunner
+      return { root, script };
+    });
+
+  const run = (
+    guard: { readonly root: string; readonly script: string },
+    args: ReadonlyArray<string>,
+  ) =>
+    Effect.gen(function* () {
+      const ran = yield* services.processRunner
         .run({
           command: "bun",
-          args: [script, "arm", thread.id, String(source.ordinal)],
-          cwd: root,
+          args: [guard.script, ...args],
+          cwd: guard.root,
           ...(services.stateDbPath === undefined
             ? {}
             : { env: { T3_STATE_PATH: services.stateDbPath } }),
@@ -99,22 +116,64 @@ export const workspaceResumeGuard =
         })
         .pipe(
           Effect.mapError(
-            (cause) => new ResumeGuardError({ detail: "resume-guard arm did not run", cause }),
+            (cause) =>
+              new ResumeGuardError({ detail: `resume-guard ${args[0]} did not run`, cause }),
           ),
         );
-      if (armed.code !== 0) {
+      if (ran.code !== 0) {
         return yield* new ResumeGuardError({
-          detail: `resume-guard arm exited ${armed.code}: ${armed.stderr.trim()}`,
+          detail: `resume-guard ${args[0]} exited ${ran.code}: ${ran.stderr.trim()}`,
         });
       }
-      const { done } = yield* decodeArmOutput(armed.stdout).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ResumeGuardError({ detail: "resume-guard arm printed no list of steps", cause }),
-        ),
-      );
-      return done;
+      return ran.stdout;
     });
+
+  return {
+    listCompletedOutwardSteps: ({ thread, source }) =>
+      Effect.gen(function* () {
+        const guard = yield* locate(thread);
+        if (guard === null) return null;
+        const stdout = yield* run(guard, ["arm", thread.id, String(source.ordinal)]);
+        const { done } = yield* decodeArmOutput(stdout).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ResumeGuardError({ detail: "resume-guard arm printed no list of steps", cause }),
+          ),
+        );
+        return done;
+      }),
+    releaseOutwardSteps: ({ thread }) =>
+      Effect.gen(function* () {
+        const guard = yield* locate(thread);
+        if (guard === null) return;
+        yield* run(guard, ["disarm", thread.id]);
+      }),
+  };
+};
+
+/**
+ * Once a delegated task whose child was continued after a provider failure settles, by success, final failure or
+ * Stop, drops the workspace's record of the child's outward steps. A failure is logged and never fails the task.
+ */
+export const releaseAfterProviderRetry = Effect.fn(
+  "ProviderRetryContinuation.releaseAfterProviderRetry",
+)(function* (input: {
+  readonly threadId: ThreadId;
+  readonly releaseOutwardSteps?: ReleaseOutwardSteps;
+}) {
+  if (input.releaseOutwardSteps === undefined) return;
+  const release = input.releaseOutwardSteps;
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  yield* threads.getThreadRecords(input.threadId, []).pipe(
+    Effect.flatMap(({ thread }) => release({ thread })),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("orchestration-v2.provider-retry.steps-not-released", {
+        threadId: input.threadId,
+        cause,
+      }),
+    ),
+  );
+});
 
 /**
  * Continues a delegated child's run that a passing provider failure cut off, once its wait is over. Whatever it

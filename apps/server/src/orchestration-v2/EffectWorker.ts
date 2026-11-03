@@ -33,7 +33,8 @@ import * as ServerConfig from "../config.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 import {
   continueAfterProviderFailure,
-  type ListCompletedOutwardSteps,
+  releaseAfterProviderRetry,
+  type ResumeGuard,
   workspaceResumeGuard,
 } from "./ProviderRetryContinuation.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -116,9 +117,7 @@ export const layerExecutor: Layer.Layer<
       projects: yield* Effect.serviceOption(ProjectStore.ProjectStoreV2),
     });
     const serverConfig = yield* Effect.serviceOption(ServerConfig.ServerConfig);
-    const listCompletedOutwardSteps: ListCompletedOutwardSteps | undefined = Option.isSome(
-      guardServices,
-    )
+    const resumeGuard: ResumeGuard | undefined = Option.isSome(guardServices)
       ? workspaceResumeGuard({
           ...guardServices.value,
           stateDbPath: Option.getOrUndefined(serverConfig)?.dbPath,
@@ -153,7 +152,9 @@ export const layerExecutor: Layer.Layer<
             return continueAfterProviderFailure({
               threadId: effect.threadId,
               sourceRunId,
-              ...(listCompletedOutwardSteps === undefined ? {} : { listCompletedOutwardSteps }),
+              ...(resumeGuard === undefined
+                ? {}
+                : { listCompletedOutwardSteps: resumeGuard.listCompletedOutwardSteps }),
             }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.tapError(() =>
@@ -171,6 +172,15 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           }
+          case "provider-runtime.retry-release":
+            return releaseAfterProviderRetry({
+              threadId: effect.threadId,
+              ...(resumeGuard === undefined
+                ? {}
+                : { releaseOutwardSteps: resumeGuard.releaseOutwardSteps }),
+            }).pipe(
+              Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
+            );
           case "provider-session.detach":
             return providerSessions
               .detach({

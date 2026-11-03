@@ -101,6 +101,7 @@ import {
   providerRetryCommandId,
   providerRetryEffectId,
   providerRetryPlan,
+  providerRetryReleaseEffectId,
 } from "./DelegatedProviderRetry.ts";
 import {
   isBufferedProviderNotification,
@@ -9917,6 +9918,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     });
 
+  /**
+   * Once a task whose child a provider retry touched has settled, writes the effect that drops the workspace's record of
+   * the child's outward steps. A retry that was scheduled may have armed it even if no continuation run followed.
+   */
+  const releaseProviderRetryGuard = (
+    settledRun: OrchestrationV2Run,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) =>
+    Effect.gen(function* () {
+      const effectId = providerRetryReleaseEffectId(settledRun.id);
+      if (Option.isSome(yield* effectOutbox.get(effectId))) return;
+      const retried =
+        runs.some((run) => run.providerRetryOfRunId !== undefined) ||
+        Option.isSome(yield* effectOutbox.get(providerRetryEffectId(settledRun.id)));
+      if (!retried) return;
+      const commandId = CommandId.make(`command:provider-retry-release:${settledRun.id}`);
+      yield* eventSink.writeWithEffects({
+        commandId,
+        events: [],
+        effects: [
+          {
+            id: effectId,
+            commandId,
+            threadId: settledRun.threadId,
+            request: { type: "provider-runtime.retry-release", settledRunId: settledRun.id },
+          },
+        ],
+      });
+    });
+
   const childAwaitsRestartContinuation = (
     runs: ReadonlyArray<OrchestrationV2Run>,
     resultRun: OrchestrationV2Run,
@@ -10440,6 +10471,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       ]);
 
+      yield* releaseProviderRetryGuard(
+        childRun,
+        taskRuns.length === 0 ? childControls.runs : taskRuns,
+      );
       if (completionPlan.offer && completionPlan.parentRun !== undefined) {
         yield* offerDelegatedCompletionDelivery(parentThreadId, completionPlan.parentRun.id);
       }

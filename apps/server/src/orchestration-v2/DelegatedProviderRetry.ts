@@ -12,6 +12,8 @@ import * as DateTime from "effect/DateTime";
  */
 export const providerRetryEffectId = (runId: RunId) => `effect:provider-retry:${runId}`;
 export const providerRetryCommandId = (runId: RunId) => `command:provider-retry:${runId}`;
+export const providerRetryReleaseEffectId = (runId: RunId) =>
+  `effect:provider-retry-release:${runId}`;
 export const providerRetryMessageId = (runId: RunId) => `message:provider-retry:${runId}`;
 
 export interface ProviderRetryPlan {

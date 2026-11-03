@@ -39,8 +39,12 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
-import { continueAfterProviderFailure, ResumeGuardError } from "./ProviderRetryContinuation.ts";
-import { providerRetryEffectId } from "./DelegatedProviderRetry.ts";
+import {
+  continueAfterProviderFailure,
+  releaseAfterProviderRetry,
+  ResumeGuardError,
+} from "./ProviderRetryContinuation.ts";
+import { providerRetryEffectId, providerRetryReleaseEffectId } from "./DelegatedProviderRetry.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as RuntimeLayer from "./runtimeLayer.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
@@ -2061,16 +2065,25 @@ it.layer(layerTest)("delegated provider retry", (it) => {
       assert.deepEqual(yield* deliveryOf(parentThreadId, parentRunId), woken);
     });
 
-  const retryEffect = (runId: RunId) =>
+  const outboxEffect = (effectId: string) =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      const rows = yield* sql<{ readonly status: string; readonly available_at: string }>`
-        SELECT status, available_at FROM orchestration_v2_effect_outbox
-        WHERE effect_id = ${providerRetryEffectId(runId)}
+      const rows = yield* sql<{
+        readonly status: string;
+        readonly available_at: string;
+        readonly thread_id: string;
+      }>`
+        SELECT status, available_at, thread_id FROM orchestration_v2_effect_outbox
+        WHERE effect_id = ${effectId}
       `;
       const row = rows[0];
-      return row === undefined ? undefined : { status: row.status, availableAt: row.available_at };
+      return row === undefined
+        ? undefined
+        : { status: row.status, availableAt: row.available_at, threadId: row.thread_id };
     });
+  const retryEffect = (runId: RunId) => outboxEffect(providerRetryEffectId(runId));
+  /** The effect that disarms the workspace's resume guard once the task settled. */
+  const releaseEffect = (runId: RunId) => outboxEffect(providerRetryReleaseEffectId(runId));
 
   /** Runs the due continuation as the effect worker would, and returns the run it started. */
   const continueCut = (childThreadId: ThreadId, sourceRunId: RunId) =>
@@ -2133,6 +2146,7 @@ it.layer(layerTest)("delegated provider retry", (it) => {
         const finished = yield* taskOf(seeded.parentThreadId, child.taskId);
         assert.equal(finished.status, "completed");
         assert.equal(finished.completionDelivery?.state, "claimed");
+        assert.equal((yield* releaseEffect(continued!.id))?.threadId, child.childThreadId);
         assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
           child.taskId,
         ]);
@@ -2164,6 +2178,7 @@ it.layer(layerTest)("delegated provider retry", (it) => {
           [1, 2, 4, 8].map((minutes) => DateTime.formatIso(DateTime.add(now, { minutes }))),
         );
         assert.isUndefined(yield* retryEffect(run.id));
+        assert.equal((yield* releaseEffect(run.id))?.threadId, child.childThreadId);
         const failed = yield* taskOf(seeded.parentThreadId, child.taskId);
         assert.equal(failed.status, "failed");
         assert.equal(failed.completionDelivery?.state, "claimed");
@@ -2188,6 +2203,7 @@ it.layer(layerTest)("delegated provider retry", (it) => {
       yield* orchestrator.recoverDelegatedTasks;
 
       assert.isUndefined(yield* retryEffect(seeded.childRun.id));
+      assert.isUndefined(yield* releaseEffect(seeded.childRun.id));
       const failed = yield* taskOf(seeded.parentThreadId, seeded.child.taskId);
       assert.equal(failed.status, "failed");
       assert.equal(failed.completionDelivery?.state, "claimed");
@@ -2223,6 +2239,7 @@ it.layer(layerTest)("delegated provider retry", (it) => {
       const stopped = yield* taskOf(seeded.parentThreadId, child.taskId);
       assert.equal(stopped.status, "failed");
       assert.isNotNull(stopped.result);
+      assert.equal((yield* releaseEffect(seeded.childRun.id))?.threadId, child.childThreadId);
       assert.isUndefined(yield* continueCut(child.childThreadId, seeded.childRun.id));
       assert.lengthOf((yield* orchestrator.getThreadProjection(child.childThreadId)).runs, 1);
     }),
@@ -2272,9 +2289,31 @@ it.layer(layerTest)("delegated provider retry", (it) => {
       const failed = yield* taskOf(seeded.parentThreadId, child.taskId);
       assert.equal(failed.status, "failed");
       assert.include(failed.result ?? "", "The provider failed the request.");
+      assert.equal((yield* releaseEffect(seeded.childRun.id))?.threadId, child.childThreadId);
       assert.deepEqual(yield* deliveredTaskIds(seeded.parentThreadId, seeded.parentRunId), [
         child.taskId,
       ]);
+    }),
+  );
+
+  it.effect("disarms the resume guard for the settled child, and a failed disarm only logs", () =>
+    Effect.gen(function* () {
+      const seeded = yield* seedCutChild("provider-retry-release");
+      const released: Array<ThreadId> = [];
+      yield* releaseAfterProviderRetry({
+        threadId: seeded.child.childThreadId,
+        releaseOutwardSteps: ({ thread }) =>
+          Effect.sync(() => {
+            released.push(thread.id);
+          }),
+      });
+      assert.deepEqual(released, [seeded.child.childThreadId]);
+
+      yield* releaseAfterProviderRetry({
+        threadId: seeded.child.childThreadId,
+        releaseOutwardSteps: () =>
+          Effect.fail(new ResumeGuardError({ detail: "resume-guard disarm exited 1" })),
+      });
     }),
   );
 });
